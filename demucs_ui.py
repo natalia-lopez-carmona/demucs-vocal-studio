@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 import numpy as np
 import librosa
+import soundfile as sf
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -123,6 +124,43 @@ def create_stems_zip(stems, file_obj):
         for k, v in valid.items():
             zf.write(v, f"{label_map.get(k,k)}.wav")
     return path
+
+# ── Custom mix of selected stems ──────────────────────────────────────────────
+
+STEM_LABELS = {
+    "vocals":"voz","drums":"bateria","bass":"bajo",
+    "guitar":"guitarra","piano":"piano","other":"otros",
+}
+
+def mix_stems(stems, selected, file_obj):
+    if not selected:
+        return None
+    paths = [stems.get(k) for k in selected if stems.get(k) and Path(stems[k]).exists()]
+    if not paths:
+        return None
+
+    datas, sr_ref = [], None
+    for p in paths:
+        data, sr = sf.read(p, always_2d=True)
+        sr_ref = sr_ref or sr
+        datas.append(data)
+
+    max_len  = max(d.shape[0] for d in datas)
+    channels = max(d.shape[1] for d in datas)
+    mix = np.zeros((max_len, channels), dtype=np.float64)
+    for d in datas:
+        mix[:d.shape[0], :d.shape[1]] += d
+
+    peak = np.max(np.abs(mix))
+    if peak > 1.0:
+        mix /= peak
+
+    song_name = file_obj.name if hasattr(file_obj, "name") else (file_obj or "mezcla")
+    tmp   = Path(tempfile.mkdtemp())
+    names = "_".join(STEM_LABELS.get(k, k) for k in selected)
+    out_path = str(tmp / f"{Path(song_name).stem}_{names}.wav")
+    sf.write(out_path, mix, sr_ref)
+    return out_path
 
 # ── Stem separation ────────────────────────────────────────────────────────────
 
@@ -258,6 +296,18 @@ with gr.Blocks(title="Vocal Studio", theme=gr.themes.Soft()) as demo:
                 btn_zip = gr.Button("Descargar todos los stems en ZIP", variant="secondary")
                 zip_dl  = gr.File(label="ZIP de stems")
 
+            gr.Markdown("---")
+            gr.Markdown("### Mezcla personalizada")
+            gr.Markdown("Elige qué pistas combinar (p. ej. voz + bajo) y descárgalas como un solo archivo.")
+            mix_select = gr.CheckboxGroup(
+                choices=[("Voz","vocals"), ("Batería","drums"), ("Bajo","bass"),
+                         ("Guitarra","guitar"), ("Piano","piano"), ("Otros","other")],
+                label="Pistas a combinar",
+            )
+            with gr.Row():
+                btn_mix = gr.Button("Mezclar y descargar selección", variant="secondary")
+                mix_dl  = gr.File(label="Mezcla descargable")
+
     # ── Events ───────────────────────────────────────────────────────────────────
 
     audio_input.change(
@@ -276,6 +326,11 @@ with gr.Blocks(title="Vocal Studio", theme=gr.themes.Soft()) as demo:
         fn=lambda stems, f: create_stems_zip(stems, f),
         inputs=[stems_state, audio_input],
         outputs=[zip_dl])
+
+    btn_mix.click(
+        fn=mix_stems,
+        inputs=[stems_state, mix_select, audio_input],
+        outputs=[mix_dl])
 
 if __name__ == "__main__":
     demo.launch(inbrowser=True)
