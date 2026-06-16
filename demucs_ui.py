@@ -65,12 +65,14 @@ def analyze_song(file_obj):
     path = file_obj.name if hasattr(file_obj, "name") else file_obj
     path = extract_audio(path)
     if not path:
-        return "—","—","—","—"
+        return "—","—","—","—", {}
     try:
         y, sr = librosa.load(path, sr=None, mono=True)
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        bpm = f"{float(np.atleast_1d(tempo)[0]):.1f} BPM"
-        mins, secs = divmod(int(librosa.get_duration(y=y, sr=sr)), 60)
+        bpm_val = float(np.atleast_1d(tempo)[0])
+        bpm = f"{bpm_val:.1f} BPM"
+        duration_sec = librosa.get_duration(y=y, sr=sr)
+        mins, secs = divmod(int(duration_sec), 60)
         chroma = librosa.feature.chroma_cqt(y=y, sr=sr, bins_per_octave=36)
         mean_c = np.mean(chroma, axis=1)
         best_key, best_corr = None, -np.inf
@@ -79,9 +81,10 @@ def analyze_song(file_obj):
                 corr = np.corrcoef(mean_c, np.roll(prof,i))[0,1]
                 if corr > best_corr:
                     best_corr, best_key = corr, f"{NOTES[i]} {mode}"
-        return bpm, f"{mins}:{secs:02d}", best_key, CAMELOT.get(best_key,"—")
+        info = {"bpm": bpm_val, "duration": duration_sec}
+        return bpm, f"{mins}:{secs:02d}", best_key, CAMELOT.get(best_key,"—"), info
     except Exception as e:
-        return "Error","Error",str(e),"—"
+        return "Error","Error",str(e),"—", {}
 
 # ── Vocal range ────────────────────────────────────────────────────────────────
 
@@ -130,13 +133,36 @@ def create_stems_zip(stems, file_obj):
 STEM_LABELS = {
     "vocals":"voz","drums":"bateria","bass":"bajo",
     "guitar":"guitarra","piano":"piano","other":"otros",
+    "metronome":"metronomo",
 }
+METRONOME_VOLUME = 0.2
 
-def mix_stems(stems, selected, file_obj):
+def generate_metronome(bpm, duration_sec, sr=44100):
+    if not bpm or bpm <= 0 or duration_sec <= 0:
+        return None
+    interval   = 60.0 / bpm
+    n_samples  = int(duration_sec * sr)
+    track      = np.zeros(n_samples)
+    click_len  = int(0.03 * sr)
+    t          = np.linspace(0, 0.03, click_len, endpoint=False)
+    click      = np.sin(2 * np.pi * 1500 * t) * np.exp(-t * 90)
+    beat_time = 0.0
+    while beat_time < duration_sec:
+        start = int(beat_time * sr)
+        end   = min(start + click_len, n_samples)
+        if end > start:
+            track[start:end] += click[:end - start]
+        beat_time += interval
+    return track
+
+def mix_stems(stems, selected, file_obj, song_info):
     if not selected:
         return None
-    paths = [stems.get(k) for k in selected if stems.get(k) and Path(stems[k]).exists()]
-    if not paths:
+
+    use_metronome = "metronome" in selected
+    real_keys = [k for k in selected if k != "metronome"]
+    paths = [stems.get(k) for k in real_keys if stems.get(k) and Path(stems[k]).exists()]
+    if not paths and not use_metronome:
         return None
 
     datas, sr_ref = [], None
@@ -145,11 +171,26 @@ def mix_stems(stems, selected, file_obj):
         sr_ref = sr_ref or sr
         datas.append(data)
 
-    max_len  = max(d.shape[0] for d in datas)
-    channels = max(d.shape[1] for d in datas)
+    if datas:
+        max_len  = max(d.shape[0] for d in datas)
+        channels = max(d.shape[1] for d in datas)
+    else:
+        sr_ref   = sr_ref or 44100
+        max_len  = int((song_info or {}).get("duration", 0) * sr_ref)
+        channels = 1
+
     mix = np.zeros((max_len, channels), dtype=np.float64)
     for d in datas:
         mix[:d.shape[0], :d.shape[1]] += d
+
+    if use_metronome and max_len > 0:
+        bpm = (song_info or {}).get("bpm")
+        click = generate_metronome(bpm, max_len / sr_ref, sr_ref)
+        if click is not None:
+            peak = np.max(np.abs(click))
+            if peak > 0:
+                click = click / peak * METRONOME_VOLUME
+            mix[:len(click), :] += click[:max_len, None]
 
     peak = np.max(np.abs(mix))
     if peak > 1.0:
@@ -236,7 +277,8 @@ def separate(file_obj, model_label, progress=gr.Progress()):
 
 with gr.Blocks(title="Vocal Studio", theme=gr.themes.Soft()) as demo:
 
-    stems_state = gr.State({})
+    stems_state     = gr.State({})
+    song_info_state = gr.State({})
 
     gr.Markdown("# Vocal Studio")
 
@@ -301,7 +343,8 @@ with gr.Blocks(title="Vocal Studio", theme=gr.themes.Soft()) as demo:
             gr.Markdown("Elige qué pistas combinar (p. ej. voz + bajo) y descárgalas como un solo archivo.")
             mix_select = gr.CheckboxGroup(
                 choices=[("Voz","vocals"), ("Batería","drums"), ("Bajo","bass"),
-                         ("Guitarra","guitar"), ("Piano","piano"), ("Otros","other")],
+                         ("Guitarra","guitar"), ("Piano","piano"), ("Otros","other"),
+                         ("Metrónomo (según tempo detectado)","metronome")],
                 label="Pistas a combinar",
             )
             with gr.Row():
@@ -312,7 +355,7 @@ with gr.Blocks(title="Vocal Studio", theme=gr.themes.Soft()) as demo:
 
     audio_input.change(
         fn=analyze_song, inputs=[audio_input],
-        outputs=[out_bpm, out_duration, out_key, out_camelot])
+        outputs=[out_bpm, out_duration, out_key, out_camelot, song_info_state])
 
     btn_sep.click(
         fn=separate,
@@ -329,7 +372,7 @@ with gr.Blocks(title="Vocal Studio", theme=gr.themes.Soft()) as demo:
 
     btn_mix.click(
         fn=mix_stems,
-        inputs=[stems_state, mix_select, audio_input],
+        inputs=[stems_state, mix_select, audio_input, song_info_state],
         outputs=[mix_dl])
 
 if __name__ == "__main__":
